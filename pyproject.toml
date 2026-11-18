@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siwc-judge"
+version = "0.1.0"
+description = "Tiny stdlib-only CLI that runs Responses API requests on your ChatGPT plan via Sign in with ChatGPT"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+siwc-judge = "siwc_judge.cli:main"
+
+[tool.setuptools]
+packages = ["siwc_judge"]
