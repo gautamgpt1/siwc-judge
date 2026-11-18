@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
 
@@ -46,9 +47,16 @@ def main(argv=None) -> int:
         elif a.stdin_json:
             if a.inp or a.out:
                 p.error("--stdin-json cannot be combined with --in/--out")
-            # progress goes to stderr so stdout carries exactly one response line
-            return api.run_stdin(sys.stdin.read(), sys.stdout, model=a.model, cache_dir=a.cache,
-                                 log=lambda m: print(m, file=sys.stderr))
+            # progress goes to stderr so stdout carries exactly one response line.
+            # Pipes are bytes: decode and encode UTF-8 explicitly, because the console code page (e.g. cp1252 on
+            # Windows) would turn non-ASCII input into lone surrogates that cannot be sent.
+            raw = sys.stdin.buffer.read().decode("utf-8")
+            out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="\n", write_through=True)
+            try:
+                return api.run_stdin(raw, out, model=a.model, cache_dir=a.cache,
+                                     log=lambda m: print(m, file=sys.stderr))
+            finally:
+                out.detach()
         else:
             if not (a.inp and a.out):
                 p.error("run needs --in and --out (or --stdin-json)")

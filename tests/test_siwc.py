@@ -671,15 +671,40 @@ class ReasoningTextAndStdin(Run):
         with self.assertRaises(api.StopRun):
             self.stdin(json.dumps({"instructions": "x"}), send)
 
+    def _stdin_run(self, payload: dict, reply: str, cache: str):
+        """Runs --stdin-json with byte-backed pipes, as a real subprocess pipe is; returns (code, stdout text, bodies)."""
+        from siwc_judge import cli
+        sent = []
+
+        def fake_send(*a, **k):
+            sent.append(a[3] if len(a) > 3 else k.get("body"))
+            return sse(*completed(reply))
+
+        stdin = io.TextIOWrapper(io.BytesIO(json.dumps(payload, ensure_ascii=False).encode("utf-8")), encoding="cp1252")
+        stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with mock.patch.object(net, "send", fake_send), mock.patch("sys.stdin", stdin), \
+                mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", io.StringIO()):
+            code = cli.main(["run", "--stdin-json", "--model", "m", "--cache", str(Path(self.tmp.name) / cache)])
+            stdout.flush()
+            text = stdout.buffer.getvalue().decode("utf-8")
+        return code, text, sent
+
     def test_cli_stdin_mode(self):
         from siwc_judge import cli
-        buf = io.StringIO()
-        with mock.patch.object(net, "send", lambda *a, **k: sse(*completed("hi"))),                 mock.patch("sys.stdin", io.StringIO(json.dumps({"input": "q"}))),                 mock.patch("sys.stdout", buf),                 mock.patch("sys.stderr", io.StringIO()):
-            code = cli.main(["run", "--stdin-json", "--model", "m", "--cache", str(Path(self.tmp.name) / "c2")])
+        code, text, _ = self._stdin_run({"input": "q"}, "hi", "c2")
         self.assertEqual(code, 0)
-        self.assertEqual(len(buf.getvalue().splitlines()), 1)
+        self.assertEqual(len(text.splitlines()), 1)
         with self.assertRaises(SystemExit):
             cli.main(["run", "--model", "m"])
+
+    def test_cli_stdin_mode_is_utf8_whatever_the_console_code_page(self):
+        # A cp1252 console must not turn UTF-8 pipe bytes into lone surrogates (they cannot be sent).
+        code, text, sent = self._stdin_run({"input": "naïve café — 東京"}, "naïve", "c3")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(text)["output_text"], "naïve")
+        body = sent[0]
+        body = body.decode("utf-8") if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(body, ensure_ascii=False))
+        self.assertIn("東京", json.dumps(json.loads(body), ensure_ascii=False))
 
 
 if __name__ == "__main__":
