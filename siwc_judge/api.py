@@ -41,17 +41,26 @@ class Unauthorized(Exception):
     pass
 
 
-def build_body(model: str, instructions: str | None, inp) -> dict:
+def build_body(model: str, instructions: str | None, inp, reasoning: dict | None = None,
+               text: dict | None = None) -> dict:
     if isinstance(inp, str):
         inp = [{"role": "user", "content": inp}]
     body = {"model": model, "input": inp, "store": False, "stream": True}
     if instructions is not None:
         body["instructions"] = instructions
+    if reasoning is not None:  # e.g. {"effort": "low"}; passed through as given
+        body["reasoning"] = reasoning
+    if text is not None:  # e.g. {"format": {"type": "json_schema", ...}}; passed through as given
+        body["text"] = text
     return body
 
 
-def request_key(model: str, instructions: str | None, inp) -> str:
-    blob = json.dumps([model, instructions, inp], sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+def request_key(model: str, instructions: str | None, inp, reasoning: dict | None = None,
+                text: dict | None = None) -> str:
+    parts = [model, instructions, inp]
+    if reasoning is not None or text is not None:  # keys of requests without them stay unchanged
+        parts += [reasoning, text]
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -218,8 +227,28 @@ def load_items(in_path: str) -> list[dict]:
         if (not isinstance(it, dict) or "id" not in it or not isinstance(it.get("input"), (str, list))
                 or not isinstance(it.get("instructions", ""), str)):
             raise StopRun(f'{in_path}:{n}: needs "id", "input" (string or list) and optional string "instructions"')
+        check_optional(it, f"{in_path}:{n}")
         items.append(it)
     return items
+
+
+def check_optional(it: dict, where: str) -> None:
+    for k in ("reasoning", "text"):
+        if it.get(k) is not None and not isinstance(it[k], dict):
+            raise StopRun(f'{where}: "{k}" must be an object')
+
+
+def parse_stdin_item(raw: str) -> dict:
+    try:
+        it = json.loads(raw)
+    except ValueError:
+        raise StopRun("stdin: not valid JSON") from None
+    if (not isinstance(it, dict) or not isinstance(it.get("input"), (str, list))
+            or not isinstance(it.get("instructions", ""), str)):
+        raise StopRun('stdin: needs "input" (string or list) and optional string "instructions"')
+    it.setdefault("id", "stdin")
+    check_optional(it, "stdin")
+    return it
 
 
 def run(in_path: str, out_path: str, *, model: str | None, cache_dir: str | None, max_requests: int | None,
@@ -227,54 +256,69 @@ def run(in_path: str, out_path: str, *, model: str | None, cache_dir: str | None
     if not model:
         raise StopRun("pass --model (list choices with: python -m siwc_judge models)")
     items = load_items(in_path)
+    with open(out_path, "w", encoding="utf-8") as out:
+        return run_items(items, out, model=model, cache_dir=cache_dir, max_requests=max_requests,
+                         min_interval_s=min_interval_s, sleep=sleep, log=log)
+
+
+def run_stdin(raw: str, out, *, model: str | None, cache_dir: str | None, log=print) -> int:
+    """Single-request mode: one request object in, one response line out (low overhead per call)."""
+    if not model:
+        raise StopRun("pass --model (list choices with: python -m siwc_judge models)")
+    return run_items([parse_stdin_item(raw)], out, model=model, cache_dir=cache_dir, max_requests=None,
+                     min_interval_s=0, log=log)
+
+
+def run_items(items: list[dict], out, *, model: str, cache_dir: str | None, max_requests: int | None,
+              min_interval_s: float, sleep=time.sleep, log=print) -> int:
     record = auth.ensure_fresh(_need_creds())
     cache = Path(cache_dir) if cache_dir else store.home() / "cache"
     cache.mkdir(parents=True, exist_ok=True)
     sent = hits = 0
     last = 0.0
     stopped: str | None = None
-    with open(out_path, "w", encoding="utf-8") as out:
-        for it in items:
-            instructions = it.get("instructions")
-            key = request_key(model, instructions, it["input"])
-            cf = cache / f"{key}.json"
-            if cf.exists():
-                res = json.loads(cf.read_text(encoding="utf-8"))
-                hits += 1
-            else:
-                if max_requests is not None and sent >= max_requests:
-                    stopped = f"reached --max-requests {max_requests}"
-                    break
-                wait = min_interval_s - (time.monotonic() - last)
-                if last and wait > 0:
-                    sleep(wait)
-                body = build_body(model, instructions, it["input"])
+    for it in items:
+        instructions = it.get("instructions")
+        reasoning, text = it.get("reasoning"), it.get("text")
+        key = request_key(model, instructions, it["input"], reasoning, text)
+        cf = cache / f"{key}.json"
+        if cf.exists():
+            res = json.loads(cf.read_text(encoding="utf-8"))
+            hits += 1
+        else:
+            if max_requests is not None and sent >= max_requests:
+                stopped = f"reached --max-requests {max_requests}"
+                break
+            wait = min_interval_s - (time.monotonic() - last)
+            if last and wait > 0:
+                sleep(wait)
+            body = build_body(model, instructions, it["input"], reasoning, text)
+            try:
                 try:
-                    try:
-                        res = call_once(record["access_token"], body)
-                    except Unauthorized:
-                        record = auth.refresh(record, rejected=record["access_token"])
-                        res = call_once(record["access_token"], body)
-                except Unauthorized as e:
-                    err = e.args[0] if e.args else {"status": 401}
-                    stopped = _stop_message(err) + f" Check the account and scopes, or run: {auth.LOGIN_CMD}"
-                    break
-                except (StopRun, auth.AuthError) as e:
-                    stopped = str(e)
-                    break
-                except OSError as e:
-                    stopped = f"stopping: network error during token refresh ({type(e).__name__})"
-                    break
-                last = time.monotonic()
-                sent += 1
-                if not res.get("error"):
-                    tmp = cf.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(res), encoding="utf-8")
-                    tmp.replace(cf)
-            out.write(json.dumps({"id": it["id"], "model": res.get("model") or model,
-                                  "output_text": res.get("output_text", ""), "usage": res.get("usage"),
-                                  "error": res.get("error")}, ensure_ascii=False) + "\n")
-            out.flush()
+                    res = call_once(record["access_token"], body)
+                except Unauthorized:
+                    record = auth.refresh(record, rejected=record["access_token"])
+                    res = call_once(record["access_token"], body)
+            except Unauthorized as e:
+                err = e.args[0] if e.args else {"status": 401}
+                stopped = _stop_message(err) + f" Check the account and scopes, or run: {auth.LOGIN_CMD}"
+                break
+            except (StopRun, auth.AuthError) as e:
+                stopped = str(e)
+                break
+            except OSError as e:
+                stopped = f"stopping: network error during token refresh ({type(e).__name__})"
+                break
+            last = time.monotonic()
+            sent += 1
+            if not res.get("error"):
+                tmp = cf.with_suffix(".tmp")
+                tmp.write_text(json.dumps(res), encoding="utf-8")
+                tmp.replace(cf)
+        out.write(json.dumps({"id": it["id"], "model": res.get("model") or model,
+                              "output_text": res.get("output_text", ""), "usage": res.get("usage"),
+                              "error": res.get("error")}, ensure_ascii=False) + "\n")
+        out.flush()
     log(f"done: {sent} sent, {hits} cached")
     if stopped:
         log(stopped)

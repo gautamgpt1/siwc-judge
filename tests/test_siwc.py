@@ -600,6 +600,87 @@ class Run(Base):
         with self.assertRaises(api.StopRun):
             self.run_cli(lambda *a, **k: sse(*completed()))
 
+class ReasoningTextAndStdin(Run):
+    FMT = {"format": {"type": "json_schema", "name": "x", "schema": {"type": "object"}, "strict": True}}
+
+    def test_body_passes_reasoning_and_text_never_unsupported(self):
+        b = api.build_body("m", "i", "q", {"effort": "low"}, self.FMT)
+        self.assertEqual(b["reasoning"], {"effort": "low"})
+        self.assertEqual(b["text"], self.FMT)
+        self.assertFalse(set(b) & set(api.UNSUPPORTED_FIELDS))
+        self.assertNotIn("reasoning", api.build_body("m", "i", "q"))
+        self.assertNotIn("text", api.build_body("m", "i", "q"))
+
+    def test_cache_key_unchanged_without_and_distinct_with(self):
+        self.assertEqual(api.request_key("m", "i", "q"), api.request_key("m", "i", "q", None, None))
+        self.assertNotEqual(api.request_key("m", "i", "q"), api.request_key("m", "i", "q", {"effort": "low"}))
+        self.assertNotEqual(api.request_key("m", "i", "q", {"effort": "low"}),
+                            api.request_key("m", "i", "q", {"effort": "high"}))
+        self.assertNotEqual(api.request_key("m", "i", "q", None, self.FMT), api.request_key("m", "i", "q"))
+
+    def test_run_sends_optional_fields_and_validates(self):
+        self.inp.write_text(json.dumps({"id": "a", "input": "q", "reasoning": {"effort": "low"},
+                                        "text": self.FMT}) + "\n", encoding="utf-8")
+        bodies = []
+
+        def send(method, url, headers=None, body=None, timeout=0):
+            bodies.append(json.loads(body))
+            return sse(*completed("{}"))
+
+        self.assertEqual(self.run_cli(send), 0)
+        self.assertEqual(bodies[0]["reasoning"], {"effort": "low"})
+        self.assertEqual(bodies[0]["text"], self.FMT)
+        self.assertFalse(set(bodies[0]) & set(api.UNSUPPORTED_FIELDS))
+        self.inp.write_text(json.dumps({"id": "a", "input": "q", "reasoning": "low"}) + "\n", encoding="utf-8")
+        with self.assertRaises(api.StopRun):
+            self.run_cli(send)
+
+    def stdin(self, raw, send, **kw):
+        out = io.StringIO()
+        with mock.patch.object(net, "send", send):
+            code = api.run_stdin(raw, out, model="m", cache_dir=str(Path(self.tmp.name) / "c"),
+                                 log=lambda *_: None, **kw)
+        return code, out.getvalue()
+
+    def test_stdin_single_request_one_line_and_cached(self):
+        n = []
+
+        def send(*a, **k):
+            n.append(1)
+            return sse(*completed("ok"))
+
+        raw = json.dumps({"input": "q", "instructions": "I", "reasoning": {"effort": "low"}})
+        code, out = self.stdin(raw, send)
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["output_text"], "ok")
+        self.assertEqual(json.loads(lines[0])["id"], "stdin")
+        code, out = self.stdin(raw, send)
+        self.assertEqual(len(n), 1)  # second call came from the cache
+
+    def test_stdin_limit_exit_and_bad_input(self):
+        def send(*a, **k):
+            return fake(429, {"error": {"code": "subscription_sharing_usage_limit_exceeded"}})
+
+        code, out = self.stdin(json.dumps({"input": "q"}), send)
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        with self.assertRaises(api.StopRun):
+            self.stdin("not json", send)
+        with self.assertRaises(api.StopRun):
+            self.stdin(json.dumps({"instructions": "x"}), send)
+
+    def test_cli_stdin_mode(self):
+        from siwc_judge import cli
+        buf = io.StringIO()
+        with mock.patch.object(net, "send", lambda *a, **k: sse(*completed("hi"))),                 mock.patch("sys.stdin", io.StringIO(json.dumps({"input": "q"}))),                 mock.patch("sys.stdout", buf),                 mock.patch("sys.stderr", io.StringIO()):
+            code = cli.main(["run", "--stdin-json", "--model", "m", "--cache", str(Path(self.tmp.name) / "c2")])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(buf.getvalue().splitlines()), 1)
+        with self.assertRaises(SystemExit):
+            cli.main(["run", "--model", "m"])
+
 
 if __name__ == "__main__":
     unittest.main()

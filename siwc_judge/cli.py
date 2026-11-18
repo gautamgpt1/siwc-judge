@@ -18,8 +18,10 @@ def main(argv=None) -> int:
     lo.add_argument("--forget", action="store_true", help="also forget the client registration (to switch accounts)")
     sub.add_parser("models", help="list the model catalog (not an entitlement check)")
     r = sub.add_parser("run", help="run a JSONL file of requests")
-    r.add_argument("--in", dest="inp", required=True)
-    r.add_argument("--out", required=True)
+    r.add_argument("--in", dest="inp")
+    r.add_argument("--out")
+    r.add_argument("--stdin-json", action="store_true",
+                   help="single-request mode: one request object on stdin, one response line on stdout")
     r.add_argument("--model", required=True, help="model slug from the models command")
     r.add_argument("--cache")
     r.add_argument("--max-requests", type=int)
@@ -41,7 +43,15 @@ def main(argv=None) -> int:
             for m in api.list_models(rec):
                 print(json.dumps({"slug": m.get("slug"), "display_name": m.get("display_name"),
                                   "visibility": m.get("visibility")}))
+        elif a.stdin_json:
+            if a.inp or a.out:
+                p.error("--stdin-json cannot be combined with --in/--out")
+            # progress goes to stderr so stdout carries exactly one response line
+            return api.run_stdin(sys.stdin.read(), sys.stdout, model=a.model, cache_dir=a.cache,
+                                 log=lambda m: print(m, file=sys.stderr))
         else:
+            if not (a.inp and a.out):
+                p.error("run needs --in and --out (or --stdin-json)")
             return api.run(a.inp, a.out, model=a.model, cache_dir=a.cache, max_requests=a.max_requests,
                            min_interval_s=a.min_interval_s)
     except (auth.AuthError, api.StopRun) as e:

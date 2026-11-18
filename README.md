@@ -27,12 +27,15 @@ python -m siwc_judge login [--consent]   # browser sign-in; the first one regist
 python -m siwc_judge models              # catalog (not an entitlement check)
 python -m siwc_judge run --in requests.jsonl --out responses.jsonl --model SLUG [--cache DIR] \
                          [--max-requests N] [--min-interval-s 1]
+python -m siwc_judge run --stdin-json --model SLUG [--cache DIR]   # one request on stdin, one line on stdout
 python -m siwc_judge refresh
 python -m siwc_judge logout [--forget]   # revokes the refresh token and clears local tokens
 ```
 
 Input lines: `{"id": "...", "instructions": "...", "input": "text" | [responses input items]}`
-(`instructions` is optional). Output lines: `{"id", "model", "output_text", "usage", "error"}`.
+(`instructions` is optional). Optional objects `reasoning` (e.g. `{"effort": "low"}`) and `text` (e.g.
+`{"format": {"type": "json_schema", ...}}`) are passed through to the request body and are part of the cache key.
+In `--stdin-json` mode `id` is optional; the one response line goes to stdout and progress to stderr. Output lines: `{"id", "model", "output_text", "usage", "error"}`.
 `--model` is required: pick a slug from `models`, so a run never changes model silently.
 
 Sign-in listens on `http://127.0.0.1:1455/auth/callback`, or on a free loopback port when 1455 is busy.
