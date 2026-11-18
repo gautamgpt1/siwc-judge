@@ -23,12 +23,10 @@ def b64url_encode(b: bytes) -> str:
 def decode_unverified(token: str) -> tuple[dict, dict, bytes, bytes]:
     try:
         h, p, s = token.split(".")
-        return (
-            json.loads(b64url_decode(h)),
-            json.loads(b64url_decode(p)),
-            b64url_decode(s),
-            f"{h}.{p}".encode("ascii"),
-        )
+        header, claims = json.loads(b64url_decode(h)), json.loads(b64url_decode(p))
+        if not isinstance(header, dict) or not isinstance(claims, dict):
+            raise ValueError("not a JSON object")
+        return header, claims, b64url_decode(s), f"{h}.{p}".encode("ascii")
     except Exception as exc:
         raise JwtError("malformed JWT") from exc
 
@@ -37,9 +35,10 @@ def verify_rs256(signing_input: bytes, signature: bytes, jwk: dict) -> bool:
     n = int.from_bytes(b64url_decode(jwk["n"]), "big")
     e = int.from_bytes(b64url_decode(jwk["e"]), "big")
     k = (n.bit_length() + 7) // 8
-    if len(signature) != k:
+    s = int.from_bytes(signature, "big")
+    if len(signature) != k or s >= n:  # RFC 8017 RSAVP1: representative must be < n
         return False
-    em = pow(int.from_bytes(signature, "big"), e, n).to_bytes(k, "big")
+    em = pow(s, e, n).to_bytes(k, "big")
     t = _SHA256_PREFIX + hashlib.sha256(signing_input).digest()
     expected = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
     return em == expected
@@ -54,9 +53,17 @@ def validate_id_token(
     keys = [
         k
         for k in jwks.get("keys", [])
-        if k.get("kty") == "RSA" and (not header.get("kid") or k.get("kid") == header.get("kid"))
+        if k.get("kty") == "RSA" and k.get("alg") in (None, "RS256") and k.get("use") in (None, "sig")
+        and (not header.get("kid") or k.get("kid") == header.get("kid"))
     ]
-    if not any(verify_rs256(signing_input, sig, k) for k in keys):
+
+    def ok(k):
+        try:
+            return verify_rs256(signing_input, sig, k)
+        except (KeyError, ValueError, TypeError):
+            return False
+
+    if not any(ok(k) for k in keys):
         raise JwtError("signature verification failed")
     if claims.get("iss") != issuer:
         raise JwtError("issuer mismatch")
